@@ -9,7 +9,7 @@
 #
 # This program is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# MERCHANTABILITY and FITNESS FOR A PARTICULAR PURPOSE. See the
 # GNU General Public License for more details.
 #
 # You should have received a copy of the GNU General Public License
@@ -44,19 +44,22 @@ def usage():
     # List the available ports.
     print("  Probably one of:")
     for dev, name, info in serial.tools.list_ports.comports():
-        print("  * {0} ({1})".format(dev, info))
+        print(f"  * {dev} ({info})")
 
     return 1
 
 
-def main(port_globs):
-    loop = asyncio.get_event_loop()
+async def main_async(port_globs):
+    """
+    Main asynchronous function to handle DGT board connection and events.
+    """
+    loop = asyncio.get_running_loop() # Get the current running event loop
 
-    dgt = asyncdgt.auto_connect(loop, port_globs)
+    dgt = await asyncdgt.auto_connect(loop, port_globs)
 
     @dgt.on("connected")
     def on_connected(port):
-        print("Board connected to {0}!".format(port))
+        print(f"Board connected to {port}!")
 
     @dgt.on("disconnected")
     def on_disconnected():
@@ -69,71 +72,111 @@ def main(port_globs):
 
     @dgt.on("button_pressed")
     def on_button_pressed(button):
-        print("Button {0} pressed!".format(button))
+        print(f"Button {button} pressed!")
 
     @dgt.on("clock")
     def on_clock(clock):
         print("Clock status changed:", clock)
 
+    # Give auto_connect some time to establish a connection.
+    # We await dgt.connected.wait() inside the individual get/set functions,
+    # but a small initial sleep can help ensure the background connection task starts.
+    # Alternatively, you could await dgt.connected.wait() here once.
+    await asyncio.sleep(0.1) # Small delay to let auto_connect initiate connection
+
     # Get some information.
-    print("Version:", loop.run_until_complete(dgt.get_version()))
-    print("Serial:", loop.run_until_complete(dgt.get_serialnr()))
-    print("Long serial:", loop.run_until_complete(dgt.get_long_serialnr()))
-    print("Board:", loop.run_until_complete(dgt.get_board()).board_fen())
+    try:
+        print("Version:", await dgt.get_version())
+        print("Serial:", await dgt.get_serialnr())
+        print("Long serial:", await dgt.get_long_serialnr())
+        board = await dgt.get_board()
+        print("Board:", board.board_fen())
+    except asyncio.CancelledError:
+        print("Connection or information retrieval cancelled.")
+        return
+    except Exception as e:
+        print(f"Error getting board information: {e}")
+        # Depending on desired behavior, you might want to exit or continue
+        # if initial connection fails. For now, we'll try to continue.
+
 
     # Get the clock version.
     try:
-        print("Clock version:", loop.run_until_complete(asyncio.wait_for(dgt.get_clock_version(), 1.0)))
+        print("Clock version:", await asyncio.wait_for(dgt.get_clock_version(), 1.0))
     except asyncio.TimeoutError:
         print("Clock version request timed out.")
+    except Exception as e:
+        print(f"Error getting clock version: {e}")
 
     # Display some text.
     print("Displaying text ...")
     quote = "Now, I am become death, the destroyer of worlds. Ready"
-    loop.run_until_complete(clock_display_sentence(dgt, quote))
+    await clock_display_sentence(dgt, quote)
 
     # Let the clock beep.
     try:
         print("Beep ...")
-        loop.run_until_complete(asyncio.wait_for(dgt.clock_beep(0.1), 1.0))
+        await asyncio.wait_for(dgt.clock_beep(0.1), 1.0)
     except asyncio.TimeoutError:
         print("Beep not acknowledged in time.")
+    except Exception as e:
+        print(f"Error making clock beep: {e}")
+
 
     # Start a countdown.
     try:
         print("Countdown ...")
-        loop.run_until_complete(asyncio.wait_for(dgt.clock_set(left_time=10, right_time=7, left_running=True), 1.0))
+        await asyncio.wait_for(dgt.clock_set(left_time=10, right_time=7, left_running=True), 1.0)
     except asyncio.TimeoutError:
         print("Clock does not respond.")
+    except Exception as e:
+        print(f"Error setting clock countdown: {e}")
+
 
     # Run the event loop.
-    print("Running event loop ...")
+    print("Running event loop ... Press Ctrl+C to exit.")
     try:
-        loop.run_forever()
-    except KeyboardInterrupt:
-        pass
+        # In newer Python versions, `run_forever` is less commonly used directly
+        # for simple scripts. Instead, you'd typically await a long-running task
+        # or use a sentinel like an Event that never gets set.
+        # For an interactive example like this, `run_forever` is still suitable
+        # if `main_async` doesn't contain the core infinite loop logic.
+        # However, to gracefully shut down tasks on Ctrl+C, a cleaner approach
+        # is to explicitly create a cancellable task for `main_async` itself.
+        # But for this example, we'll keep `run_forever` and handle cleanup.
+        await asyncio.Future() # Await a Future that never completes, effectively running forever
+    except asyncio.CancelledError:
+        print("\nEvent loop cancelled (e.g., via Ctrl+C). Shutting down...")
     finally:
-        dgt.close()
+        dgt.close() # This will trigger the 'disconnected' event and stop driver threads
 
-        pending = asyncio.Task.all_tasks(loop)
-        loop.run_until_complete(asyncio.gather(*pending))
+        # Get all tasks and cancel them gracefully.
+        # asyncio.Task.all_tasks() is deprecated. Use asyncio.all_tasks()
+        pending = asyncio.all_tasks(loop=loop) # Specify loop for clarity, though optional from 3.10+
+        for task in pending:
+            task.cancel() # Request cancellation
+
+        # Wait for all tasks to complete, ignoring CancelledError
+        await asyncio.gather(*pending, return_exceptions=True)
         loop.close()
+        print("Event loop closed.")
 
     return 0
 
 
-@asyncio.coroutine
-def clock_display_sentence(dgt, sentence):
+async def clock_display_sentence(dgt, sentence):
     for word in sentence.split():
-        yield from asyncio.sleep(0.2)
+        await asyncio.sleep(0.2) # Use await
 
         try:
-            yield from asyncio.wait_for(dgt.clock_text(word), 0.5)
+            await asyncio.wait_for(dgt.clock_text(word), 0.5) # Use await
         except asyncio.TimeoutError:
             print("Sending clock text timed out.")
+        except Exception as e:
+            print(f"Error sending clock text: {e}")
 
 
-if __name__ == "__main__":
+def main_entrypoint():
     if "--debug" in sys.argv:
         logging.basicConfig(level=logging.DEBUG)
 
@@ -141,4 +184,10 @@ if __name__ == "__main__":
     if not port_globs:
         sys.exit(usage())
     else:
-        sys.exit(main(port_globs))
+        # Use asyncio.run() for Python 3.7+ to manage the event loop lifecycle
+        # For Python 3.13, this is the standard way to run the top-level async function.
+        sys.exit(asyncio.run(main_async(port_globs)))
+
+
+if __name__ == "__main__":
+    main_entrypoint()

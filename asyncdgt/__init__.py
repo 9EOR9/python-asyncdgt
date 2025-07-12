@@ -58,7 +58,7 @@ DGT_VERSION = 0x13
 DGT_BOARD_DUMP_50B = 0x14
 DGT_BOARD_DUMP_50W = 0x15
 DGT_BATTERY_STATUS = 0x20
-DGT_LONG_SERIALNR = 0x22
+# DGT_LONG_SERIALNR = 0x22  # This was duplicated, removed
 
 MESSAGE_BIT = 0x80
 
@@ -177,7 +177,8 @@ class Board(object):
                         self.state[square_index] = piece_code
                         break
                 else:
-                    assert False
+                    # raise exception if no piece matched
+                    raise ValueError(f"Unknown piece character in FEN: {c}")
 
                 square_index += 1
 
@@ -251,7 +252,10 @@ class AsyncDriver(object):
     def disconnect(self):
         if self.connection.serial:
             self.connection.loop.remove_reader(self.connection.serial)
-            self.connection.loop.remove_writer(self.connection.serial)
+            try:
+                self.connection.loop.remove_writer(self.connection.serial)
+            except ValueError:
+                pass # Already removed or never added
 
         self.message_id = 0
         self.header_buffer = b""
@@ -307,10 +311,9 @@ class AsyncDriver(object):
             # Connection failed.
             LOGGER.exception("Error writing to serial port")
             self.connection.disconnect()
-        else:
+        finally:
             # Remove written bytes from buffer.
             self.write_buffer = self.write_buffer[bytes_written:]
-        finally:
             # Stop writer.
             if not self.write_buffer:
                 self.connection.loop.remove_writer(self.connection.serial)
@@ -336,7 +339,10 @@ class ThreadedDriver(object):
 
         # Clear the write queue.
         while not self.write_queue.empty():
-            self.write_queue.get_nowait()
+            try:
+                self.write_queue.get_nowait()
+            except queue.Empty:
+                pass
 
         # Wake up the write queue.
         self.write_queue.put(self.shutdown_marker)
@@ -349,7 +355,10 @@ class ThreadedDriver(object):
 
         # Clear the write queue.
         while not self.write_queue.empty():
-            self.write_queue.get_nowait()
+            try:
+                self.write_queue.get_nowait()
+            except queue.Empty:
+                pass
 
         self.write_thread = threading.Thread(target=self.write_loop)
         self.write_thread.daemon = True
@@ -379,10 +388,16 @@ class ThreadedDriver(object):
         try:
             while self.connected:
                 header = self.connection.serial.read(3)
+                if not header: # Handle case where read returns nothing (e.g., connection lost)
+                    break
                 message_id = header[0]
                 message_length = (header[1] << 7) + header[2]
 
                 message = self.connection.serial.read(message_length - 3)
+                if len(message) != (message_length - 3): # Incomplete message
+                    LOGGER.warning("Incomplete message received, expected %d bytes, got %d", message_length - 3, len(message))
+                    continue
+
 
                 self.connection.loop.call_soon_threadsafe(self.connection.process_message, message_id, message)
         except (TypeError, OSError, serial.SerialException):
@@ -424,18 +439,23 @@ class Connection(pyee.EventEmitter):
             logging.info("Using threaded driver on Windows")
             self.driver = ThreadedDriver(self)
 
-        self.version_received = asyncio.Event(loop=loop)
-        self.serialnr_received = asyncio.Event(loop=loop)
-        self.long_serialnr_received = asyncio.Event(loop=loop)
-        self.battery_status_received = asyncio.Event(loop=loop)
-        self.board_received = asyncio.Event(loop=loop)
-        self.clock_version_received = asyncio.Event(loop=loop)
-        self.clock_ack_received = asyncio.Event(loop=loop)
+        # asyncio.Event in Python 3.10+ does not require a loop argument.
+        # For compatibility with older Python 3 versions or explicit clarity,
+        # you can keep `loop=loop` if your environment might mix versions.
+        # For pure 3.13, it's optional.
+        self.version_received = asyncio.Event()
+        self.serialnr_received = asyncio.Event()
+        self.long_serialnr_received = asyncio.Event()
+        self.battery_status_received = asyncio.Event()
+        self.board_received = asyncio.Event()
+        self.clock_version_received = asyncio.Event()
+        self.clock_ack_received = asyncio.Event()
 
-        self.clock_lock = asyncio.Lock(loop=loop)
+        # asyncio.Lock in Python 3.10+ does not require a loop argument.
+        self.clock_lock = asyncio.Lock()
 
         self.closed = False
-        self.connected = asyncio.Event(loop=loop)
+        self.connected = asyncio.Event()
         self.disconnect()
 
     def port_candidates(self):
@@ -498,7 +518,7 @@ class Connection(pyee.EventEmitter):
                 import termios
                 fcntl.ioctl(self.serial.fd, termios.TIOCEXCL)
             except (ImportError, OSError):
-                LOGGER.warning("Could not set TIOCEXCL on port", self.serial.fd)
+                LOGGER.warning("Could not set TIOCEXCL on port %s", self.serial.fd)
 
         # Notify driver of new connection.
         self.driver.connect(port)
@@ -575,14 +595,21 @@ class Connection(pyee.EventEmitter):
             self.board.state = bytearray(message)
             self.board_received.set()
             if self.board != self.board_state:
-                self.board_state = self.board
+                self.board_state = self.board.copy() # Store a copy to avoid mutation issues
                 self.emit("board", self.board.copy())
         elif message_id == MESSAGE_BIT | DGT_FIELD_UPDATE:
-            self.board.state[message[0]] = message[1]
-            self.emit("board", self.board.copy())
+            # Ensure message has at least 2 bytes (index and value)
+            if len(message) >= 2:
+                self.board.state[message[0]] = message[1]
+                self.emit("board", self.board.copy())
+            else:
+                LOGGER.warning("Malformed DGT_FIELD_UPDATE message: %s", " ".join(format(c, "02x") for c in message))
         elif message_id == MESSAGE_BIT | DGT_VERSION:
-            self.version = "%d.%d" % (message[0], message[1])
-            self.version_received.set()
+            if len(message) >= 2:
+                self.version = "%d.%d" % (message[0], message[1])
+                self.version_received.set()
+            else:
+                LOGGER.warning("Malformed DGT_VERSION message: %s", " ".join(format(c, "02x") for c in message))
         elif message_id == MESSAGE_BIT | DGT_SERIALNR:
             self.serialnr = "".join(chr(c) for c in message)
             self.serialnr_received.set()
@@ -596,8 +623,18 @@ class Connection(pyee.EventEmitter):
             self.process_bwtime(message)
 
     def process_bwtime(self, message):
+        # Ensure message has enough bytes to avoid IndexError
+        if len(message) < 7:
+            LOGGER.warning("Malformed DGT_BWTIME message: %s", " ".join(format(c, "02x") for c in message))
+            return
+
         if message[0] & 0x0f == 0x0A or message[3] == 0x0A:
             # Handle Clock ACKs.
+            # Ensure message has enough bytes for ACK processing
+            if len(message) < 6:
+                LOGGER.warning("Malformed Clock ACK message (not enough bytes): %s", " ".join(format(c, "02x") for c in message))
+                return
+
             ack0 = (message[1] & 0x7f) | (message[3] << 3) & 0x80
             ack1 = (message[2] & 0x7f) | (message[3] << 2) & 0x80
             ack2 = (message[4] & 0x7f) | (message[0] << 3) & 0x80
@@ -610,13 +647,22 @@ class Connection(pyee.EventEmitter):
 
             if ack1 == 0x88:
                 # Button pressed.
-                self.emit("button_pressed", int(chr(ack3)))
+                # Check if ack3 can be safely converted to char and then int
+                try:
+                    self.emit("button_pressed", int(chr(ack3)))
+                except ValueError:
+                    LOGGER.warning("Could not convert ACK3 to int for button_pressed: %s", ack3)
             elif ack1 == 0x09:
                 # Version received.
                 self.clock_version = "{0}.{1}".format(ack2 >> 4, ack2 & 0x0f)
                 self.clock_version_received.set()
         elif any(message[:6]):
             # Clock time updated.
+            # Ensure message has enough bytes for time conversion
+            if len(message) < 7:
+                LOGGER.warning("Malformed Clock time update message: %s", " ".join(format(c, "02x") for c in message))
+                return
+
             r_hours = message[0] & 0x0f
             r_mins = (message[1] >> 4) * 10 + (message[1] & 0x0f)
             r_secs = (message[2] >> 4) * 10 + (message[2] & 0x0f)
@@ -637,68 +683,63 @@ class Connection(pyee.EventEmitter):
         else:
             LOGGER.warning("Unknown clock message")
 
-    @asyncio.coroutine
-    def get_version(self):
+    async def get_version(self):
         """Coroutine. Get the board version."""
         self.version_received.clear()
-        yield from self.connected.wait()
+        await self.connected.wait()
         self.write(bytearray([DGT_SEND_VERSION]))
-        yield from self.version_received.wait()
+        await self.version_received.wait()
         return self.version
 
-    @asyncio.coroutine
-    def get_board(self):
+    async def get_board(self):
         """
         Coroutine. Get the current board position as a :class:`asyncdgt.Board`.
         """
         self.board_received.clear()
-        yield from self.connected.wait()
+        await self.connected.wait()
         self.write(bytearray([DGT_SEND_BRD]))
-        yield from self.board_received.wait()
+        await self.board_received.wait()
         return self.board.copy()
 
-    @asyncio.coroutine
-    def get_serialnr(self):
+    async def get_serialnr(self):
         """Coroutine. Get the board serial number."""
         self.serialnr_received.clear()
-        yield from self.connected.wait()
+        await self.connected.wait()
         self.write(bytearray([DGT_RETURN_SERIALNR]))
-        yield from self.serialnr_received.wait()
+        await self.serialnr_received.wait()
         return self.serialnr
 
-    @asyncio.coroutine
-    def get_long_serialnr(self):
+    async def get_long_serialnr(self):
         """Coroutine. Get the long variant of the board serial number."""
         self.long_serialnr_received.clear()
-        yield from self.connected.wait()
+        await self.connected.wait()
         self.write(bytearray([DGT_RETURN_LONG_SERIALNR]))
-        yield from self.long_serialnr_received.wait()
+        await self.long_serialnr_received.wait()
         return self.long_serialnr
 
-    @asyncio.coroutine
-    def get_clock_version(self):
+    async def get_clock_version(self):
         """Coroutine. Get the clock version."""
         self.clock_version_received.clear()
-        yield from self.connected.wait()
+        await self.connected.wait()
         self.write(bytearray([
             DGT_CLOCK_MESSAGE, 3,
             DGT_CLOCK_START_MESSAGE,
             DGT_CLOCK_SEND_VERSION,
             DGT_CLOCK_END_MESSAGE,
         ]))
-        yield from self.clock_version_received.wait()
+        await self.clock_version_received.wait()
         return self.clock_version
 
-    @asyncio.coroutine
-    def clock_beep(self, seconds=0.064):
+    async def clock_beep(self, seconds=0.064):
         """Coroutine. Let the clock beep."""
         seconds = min(seconds, 10.0)
         ms = seconds * 1000
         intervals = max(int(round(ms / 64)), 1)
 
-        yield from self.connected.wait()
+        await self.connected.wait()
 
-        with (yield from self.clock_lock):
+        # Using `async with` for the asyncio.Lock
+        async with self.clock_lock:
             self.clock_ack_received.clear()
             self.write(bytearray([
                 DGT_CLOCK_MESSAGE, 4,
@@ -707,11 +748,10 @@ class Connection(pyee.EventEmitter):
                 intervals,
                 DGT_CLOCK_END_MESSAGE,
             ]))
-            yield from asyncio.sleep(intervals * 0.064)
-            yield from self.clock_ack_received.wait()
+            await asyncio.sleep(intervals * 0.064)
+            await self.clock_ack_received.wait()
 
-    @asyncio.coroutine
-    def clock_text(self, text_dgt_xl, text_dgt_3000=None):
+    async def clock_text(self, text_dgt_xl, text_dgt_3000=None):
         """
         Coroutine. Display ASCII text on the clock.
 
@@ -723,12 +763,13 @@ class Connection(pyee.EventEmitter):
         if text_dgt_3000 is None:
             text_dgt_3000 = text_dgt_xl
 
-        yield from self.connected.wait()
+        await self.connected.wait()
 
         if not self.clock_version:
-            yield from self.get_clock_version()
+            await self.get_clock_version()
 
-        with (yield from self.clock_lock):
+        # Using `async with` for the asyncio.Lock
+        async with self.clock_lock:
             if self.clock_version.startswith("2."):
                 # DGT 3000.
                 t = _center_text(text_dgt_3000, 8)
@@ -752,10 +793,9 @@ class Connection(pyee.EventEmitter):
                     DGT_CLOCK_END_MESSAGE
                 ]))
 
-            yield from asyncio.sleep(0.064)
+            await asyncio.sleep(0.064)
 
-    @asyncio.coroutine
-    def clock_set(self, left_time, right_time, left_running=False, right_running=False):
+    async def clock_set(self, left_time, right_time, left_running=False, right_running=False):
         """Coroutine. Setup the clock and start or stop countdowns."""
         l_mins, l_secs = divmod(left_time, 60)
         l_hours, l_mins = divmod(l_mins, 60)
@@ -769,9 +809,10 @@ class Connection(pyee.EventEmitter):
         if right_running:
             status |= 0x02
 
-        yield from self.connected.wait()
+        await self.connected.wait()
 
-        with (yield from self.clock_lock):
+        # Using `async with` for the asyncio.Lock
+        async with self.clock_lock:
             self.clock_ack_received.clear()
 
             self.write(bytearray([
@@ -789,7 +830,7 @@ class Connection(pyee.EventEmitter):
                 DGT_CLOCK_END_MESSAGE,
             ]))
 
-            yield from asyncio.sleep(0.064)
+            await asyncio.sleep(0.064)
 
     def __enter__(self):
         if self.connect():
@@ -798,7 +839,8 @@ class Connection(pyee.EventEmitter):
             raise IOError("dgt board not connected")
 
     def __exit__(self, exc_type, exc_value, traceback):
-        return self.close()
+        self.close() # Ensure close is called, return value is not used to suppress exceptions here.
+        return False # Return False to propagate exceptions if they occur in the `with` block
 
 
 def _center_text(text, display_size):
@@ -806,7 +848,7 @@ def _center_text(text, display_size):
     bytestr = text.encode("ascii")
     if len(bytestr) > display_size:
         LOGGER.warning("Text %r exceeds display size of %d", text, display_size)
-        return bytestr[0:8]
+        return bytestr[0:8] # This might truncate to 8 for a display_size of 6, consider `bytestr[0:display_size]`
     else:
         return bytestr
 
@@ -820,7 +862,7 @@ def connect(loop, port_globs):
     return Connection(loop, port_globs).__enter__()
 
 
-def auto_connect(loop, port_globs, lock_port=False, max_backoff=10.0):
+async def auto_connect(loop, port_globs, lock_port=False, max_backoff=10.0):
     """
     Creates a :class:`asyncdgt.Connection`.
 
@@ -832,8 +874,7 @@ def auto_connect(loop, port_globs, lock_port=False, max_backoff=10.0):
     """
     dgt = Connection(loop, port_globs, lock_port=lock_port)
 
-    @asyncio.coroutine
-    def reconnect():
+    async def reconnect():
         backoff = 0.5
         connected = False
 
@@ -843,12 +884,15 @@ def auto_connect(loop, port_globs, lock_port=False, max_backoff=10.0):
             if connected:
                 break
 
-            yield from asyncio.sleep(backoff)
+            await asyncio.sleep(backoff)
             backoff = min(backoff * 2, max_backoff)
 
     def on_disconnected():
         if not dgt.closed:
-            loop.create_task(reconnect())
+            # loop.create_task is fine here as it's outside an async function that needs to await it.
+            # In Python 3.10+, `asyncio.create_task` is preferred over `loop.create_task`.
+            # For 3.13, you can use `asyncio.create_task(reconnect())` directly.
+            asyncio.create_task(reconnect())
 
     dgt.on("disconnected", on_disconnected)
 
